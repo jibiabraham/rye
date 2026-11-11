@@ -1,0 +1,21 @@
+name: gate
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  gate:
+    runs-on: wolfi
+    steps:
+      - name: clone
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          REF: ${{ github.ref }}
+        run: |
+          git init -q repo && cd repo
+          git fetch -q --depth 1 "${SERVER/:\/\//://x:$TOKEN@}/$REPO.git" "$REF"
+          git checkout -q FETCH_HEAD
+          git log --oneline -1
+      - name: gate
+        run: make -C repo gate

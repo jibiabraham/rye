@@ -1,0 +1,5 @@
+#cloud-config
+users:
+  - name: dev
+    shell: /bin/bash
+    lock_passwd: true

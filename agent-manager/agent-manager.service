@@ -1,0 +1,10 @@
+[Unit]
+Description=agent-manager
+
+[Service]
+ExecStart=/usr/bin/node %h/.local/share/agent-manager/main.ts
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+
+[Install]
+WantedBy=default.target

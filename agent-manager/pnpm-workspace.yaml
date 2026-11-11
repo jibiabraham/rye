@@ -1,0 +1,9 @@
+packages:
+  - .
+minimumReleaseAge: 1440
+blockExoticSubdeps: true
+trustPolicy: no-downgrade
+verifyStoreIntegrity: true
+overrides:
+  # GHSA-g3hv-75wg-m249 affects minimatch 7 to 11.0.0, which eslint pulls in.
+  "minimatch@>=7 <11.0.1": "^11.0.1"

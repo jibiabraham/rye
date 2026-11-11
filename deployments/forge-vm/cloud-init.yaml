@@ -1,0 +1,88 @@
+#cloud-config
+# User-data for a forge VM. It installs Docker CE, then uses Docker Compose to start Forgejo and a Forgejo runner, which
+# runs CI jobs on the VM's Docker.
+# Create the VM from the repository root with
+#   ssh rye new forge --cloud-init < deployments/forge-vm/cloud-init.yaml
+# Forgejo listens on 127.0.0.1:3000. Other VMs reach it through an integration whose URL is http://forge.rye:3000.
+# First boot writes /srv/forge/compose.yaml and the runner's config.yml, and registers the runner with the shared
+# secret in config.yml.
+# A daily timer pulls new images for the tags in compose.yaml and restarts each container with a changed image.
+package_update: true
+packages: [ca-certificates, curl, jq, openssl]
+
+runcmd:
+  - |
+    set -eu
+    # Install Docker CE from Docker's apt repository, with unattended upgrades.
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+      "$(. /etc/os-release && echo "$VERSION_CODENAME")" > /etc/apt/sources.list.d/docker.sources
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null
+    printf 'Unattended-Upgrade::Origins-Pattern {\n  "origin=Docker,label=Docker CE";\n};\n' > /etc/apt/apt.conf.d/52unattended-docker
+
+    # Write the Compose file and runner config, start the containers and register the runner.
+    F=/srv/forge
+    mkdir -p $F/forgejo $F/runner
+    SHARED_SECRET=$(openssl rand -hex 20)
+    RUNNER_UUID=$(printf %s "$SHARED_SECRET" | python3 -c 'import sys,uuid; print(uuid.UUID(bytes=sys.stdin.read()[:16].encode()))')
+    cat > $F/compose.yaml <<C
+    name: forge
+    services:
+      forgejo:
+        image: data.forgejo.org/forgejo/forgejo:17
+        restart: unless-stopped
+        environment:
+          FORGEJO__security__INSTALL_LOCK: "true"
+          FORGEJO__server__HTTP_PORT: "3000"
+          FORGEJO__service__DISABLE_REGISTRATION: "true"
+          FORGEJO__repository__DEFAULT_REPO_UNITS: "repo.code,repo.pulls,repo.issues,repo.actions"
+        volumes:
+          - /srv/forge/forgejo:/data
+        ports:
+          - 127.0.0.1:3000:3000
+      runner:
+        image: data.forgejo.org/forgejo/runner:13
+        restart: unless-stopped
+        depends_on: [forgejo]
+        user: 1000:1000
+        group_add: ["$(getent group docker | cut -d: -f3)"]
+        volumes:
+          - /srv/forge/runner:/data
+          - /var/run/docker.sock:/var/run/docker.sock
+        command: forgejo-runner --config config.yml daemon
+    C
+    # The runner starts jobs on the VM's Docker, one at a time, on the compose network, where Forgejo is
+    # http://forgejo:3000. docker_host "-" keeps the Docker socket out of jobs, and force_pull fetches a newer job image
+    # when one exists.
+    cat > $F/runner/config.yml <<C
+    log:
+      level: info
+    runner:
+      file: .runner
+      capacity: 1
+      labels:
+        - docker:docker://data.forgejo.org/oci/node:lts
+    container:
+      network: forge_default
+      docker_host: "-"
+      force_pull: true
+    server:
+      connections:
+        default:
+          url: http://forgejo:3000
+          uuid: $RUNNER_UUID
+          token: $SHARED_SECRET
+    C
+    chmod 600 $F/runner/config.yml
+    chown -R 1000:1000 $F/forgejo $F/runner
+    docker compose -f $F/compose.yaml up -d
+    until docker compose -f $F/compose.yaml exec -T -u git forgejo forgejo admin user list >/dev/null 2>&1; do sleep 2; done
+    docker compose -f $F/compose.yaml exec -T -u git forgejo forgejo forgejo-cli actions register --keep-labels --secret "$SHARED_SECRET"
+
+    # Pull new images daily and restart each container with a changed image.
+    printf '[Unit]\nDescription=Pull and restart the forge containers\n[Service]\nType=oneshot\nExecStart=/usr/bin/docker compose -f %s/compose.yaml pull -q\nExecStart=/usr/bin/docker compose -f %s/compose.yaml up -d\n' $F $F > /etc/systemd/system/forge-update.service
+    printf '[Unit]\nDescription=Daily forge image update\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=1h\nPersistent=true\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/forge-update.timer
+    systemctl daemon-reload
+    systemctl enable --now forge-update.timer

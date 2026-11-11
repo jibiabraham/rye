@@ -1,0 +1,11 @@
+[Unit]
+Description=rye GUI for this VM's agent-manager
+
+[Service]
+# After 30 minutes without agent-manager activity, ryed powers the VM off with sudo.
+ExecStart=/usr/local/bin/ryed -local rye-admin -idle 30m
+User=admin
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

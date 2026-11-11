@@ -1,0 +1,106 @@
+#cloud-config
+# User-data for a workspace VM. It installs the toolchains that make gate and make e2e need, and Incus for
+# make up and the test-* targets. docs/how-to/workspace-vm.md gives the create command and its sizes.
+# Go matches go.mod. pnpm matches packageManager and Playwright matches @playwright/test, both in web/package.json.
+# Node is on the release line that NodeMajor names in internal/vmconfig/node.go. Tools install under /opt/tools, one
+# directory per version. Symlinks in /usr/local/bin add the tools to every PATH.
+# docs/explanation/vm-setup.md describes when user-data runs.
+package_update: true
+packages: [git, make, jq, curl, ca-certificates, xz-utils, build-essential, ripgrep, tmux]
+
+runcmd:
+  - |
+    set -eu
+    NODE=26.13.0
+    PNPM=11.8.0
+    PLAYWRIGHT=1.63.0
+    GO=1.27.4
+    GOLANGCI_LINT=2.14.0
+    GOVULNCHECK=1.8.0
+    SHELLCHECK=0.11.0
+    T=/opt/tools
+    mkdir -p $T
+    cd /tmp
+
+    # Node from nodejs.org, checked against SHASUMS256.txt. pnpm from npm, checked against the registry integrity hash.
+    if [ ! -x $T/node-$NODE/bin/node ]; then
+      F=node-v$NODE-linux-x64.tar.xz
+      curl -fsSLO https://nodejs.org/dist/v$NODE/$F
+      curl -fsSL https://nodejs.org/dist/v$NODE/SHASUMS256.txt | grep " $F\$" | sha256sum -c -
+      mkdir -p $T/node-$NODE
+      tar -xJf $F -C $T/node-$NODE --strip-components=1
+      rm -f $F
+    fi
+    export PATH=$T/node-$NODE/bin:$PATH
+    [ "$(pnpm --version 2>/dev/null)" = $PNPM ] || npm install -g --no-fund --no-audit pnpm@$PNPM
+    ln -sfn $T/node-$NODE/bin/node $T/node-$NODE/bin/npm $T/node-$NODE/bin/npx $T/node-$NODE/bin/pnpm /usr/local/bin/
+
+    # Go from go.dev, checksum from the go.dev download index.
+    if [ ! -x $T/go-$GO/bin/go ]; then
+      F=go$GO.linux-amd64.tar.gz
+      S=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | jq -r --arg f "$F" '[.[].files[] | select(.filename == $f) | .sha256][0] // empty')
+      [ ${#S} -eq 64 ] || { echo "no checksum for $F on go.dev"; exit 1; }
+      curl -fsSLO https://go.dev/dl/$F
+      echo "$S  $F" | sha256sum -c -
+      mkdir -p $T/go-$GO
+      tar -xzf $F -C $T/go-$GO --strip-components=1
+      rm -f $F
+    fi
+    ln -sfn $T/go-$GO/bin/go $T/go-$GO/bin/gofmt /usr/local/bin/
+
+    # golangci-lint release tarball, checksum from the release's checksums file.
+    if [ ! -x $T/golangci-lint-$GOLANGCI_LINT ]; then
+      N=golangci-lint-$GOLANGCI_LINT-linux-amd64
+      U=https://github.com/golangci/golangci-lint/releases/download/v$GOLANGCI_LINT
+      curl -fsSLO $U/$N.tar.gz
+      curl -fsSL $U/golangci-lint-$GOLANGCI_LINT-checksums.txt | grep " $N.tar.gz\$" | sha256sum -c -
+      tar -xzf $N.tar.gz --strip-components=1 $N/golangci-lint
+      mv golangci-lint $T/golangci-lint-$GOLANGCI_LINT
+      rm -f $N.tar.gz
+    fi
+    ln -sfn $T/golangci-lint-$GOLANGCI_LINT /usr/local/bin/golangci-lint
+
+    # govulncheck built with go install. go install checks the module against sum.golang.org.
+    if [ ! -x $T/govulncheck-$GOVULNCHECK ]; then
+      G=/tmp/govulncheck-build
+      GOBIN=$G/bin GOPATH=$G GOCACHE=$G/cache GOFLAGS=-modcacherw $T/go-$GO/bin/go install golang.org/x/vuln/cmd/govulncheck@v$GOVULNCHECK
+      mv $G/bin/govulncheck $T/govulncheck-$GOVULNCHECK
+      rm -rf $G
+    fi
+    ln -sfn $T/govulncheck-$GOVULNCHECK /usr/local/bin/govulncheck
+
+    # shellcheck release tarball, checksum from the release asset's digest on the GitHub API.
+    if [ ! -x $T/shellcheck-$SHELLCHECK ]; then
+      F=shellcheck-v$SHELLCHECK.linux.x86_64.tar.gz
+      S=$(curl -fsSL https://api.github.com/repos/koalaman/shellcheck/releases/tags/v$SHELLCHECK | jq -r --arg f "$F" '.assets[] | select(.name == $f) | .digest' | sed 's/^sha256://')
+      [ ${#S} -eq 64 ] || { echo "no sha256 digest for $F on the release"; exit 1; }
+      curl -fsSLO https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK/$F
+      echo "$S  $F" | sha256sum -c -
+      tar -xzf $F --strip-components=1 shellcheck-v$SHELLCHECK/shellcheck
+      mv shellcheck $T/shellcheck-$SHELLCHECK
+      rm -f $F
+    fi
+    ln -sfn $T/shellcheck-$SHELLCHECK /usr/local/bin/shellcheck
+
+    # Install the system libraries and fonts that Playwright's headless Chromium needs. The gate downloads Chromium into
+    # ~/.cache.
+    npx -y playwright@$PLAYWRIGHT install-deps chromium >/dev/null
+
+  # Incus from the Zabbly stable channel, with the steps of scripts/incus-setup.sh.
+  - |
+    set -eu
+    K=/tmp/zabbly.asc
+    curl -fsSL https://pkgs.zabbly.com/key.asc -o $K
+    [ "$(gpg --show-keys --with-colons $K | awk -F: '/^fpr:/{print $10; exit}')" = 4EFC590696CB15B87C73A3AD82CC8797C838DCFD ]
+    install -D -m 0644 $K /etc/apt/keyrings/zabbly.asc
+    rm -f $K
+    printf 'Enabled: yes\nTypes: deb\nURIs: https://pkgs.zabbly.com/incus/stable\nSuites: %s\nComponents: main\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/zabbly.asc\n' \
+      "$(. /etc/os-release && echo "$VERSION_CODENAME")" "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/zabbly-incus.sources
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq incus zfsutils-linux nftables >/dev/null
+    printf 'Unattended-Upgrade::Origins-Pattern {\n  "origin=pkgs.zabbly.com,label=incus-stable";\n};\n' > /etc/apt/apt.conf.d/52unattended-zabbly
+    # The same preseed as scripts/incus-setup.sh. It creates the ZFS pool default that make up uses. Inner VMs are ZFS
+    # clones of their image.
+    printf 'storage_pools:\n- name: default\n  driver: zfs\n  config:\n    size: 30GiB\n' | incus admin init --preseed
+    # dev joins incus-admin to run the make targets without sudo.
+    usermod -aG incus-admin dev

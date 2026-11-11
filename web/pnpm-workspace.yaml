@@ -1,0 +1,12 @@
+packages:
+  - .
+minimumReleaseAge: 1440
+blockExoticSubdeps: true
+trustPolicy: no-downgrade
+verifyStoreIntegrity: true
+# pnpm reports semver 6.3.1 as a trust downgrade. @babel/core needs it, through eslint-plugin-react-hooks.
+trustPolicyExclude:
+  - semver@6.3.1
+overrides:
+  # GHSA-g3hv-75wg-m249 affects minimatch 7 to 11.0.0. eslint-plugin-jsx-a11y needs the 3.x line.
+  "minimatch@>=7 <11.0.1": "^11.0.1"
